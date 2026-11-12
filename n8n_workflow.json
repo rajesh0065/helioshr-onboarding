@@ -1,0 +1,204 @@
+{
+  "name": "HeliosHR — New Hire Onboarding",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "minutes", "minutesInterval": 5 }]
+        }
+      },
+      "id": "node-schedule",
+      "name": "Every 5 min — Poll Workday",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [0, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://wd3.myworkday.com/helioshr/public/v1/workers?status=Active&changedSince={{ $now.minus(5, 'minutes').toISO() }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "workdayOAuth2Api",
+        "options": {
+          "response": { "response": { "responseFormat": "json" } }
+        }
+      },
+      "id": "node-workday-poll",
+      "name": "Workday — Get New Active Workers",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [220, 300],
+      "credentials": { "workdayOAuth2Api": { "id": "cred-workday", "name": "Workday OAuth2" } }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true },
+          "conditions": [
+            {
+              "id": "cond-has-workers",
+              "leftValue": "={{ $json.data.length }}",
+              "rightValue": 0,
+              "operator": { "type": "number", "operation": "gt" }
+            }
+          ]
+        }
+      },
+      "id": "node-has-new-hires",
+      "name": "Any new hires?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [440, 300]
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "data",
+        "options": {}
+      },
+      "id": "node-split",
+      "name": "Split — one item per hire",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [660, 180]
+    },
+    {
+      "parameters": {
+        "jsCode": "const w = $input.item.json;\nreturn [{\n  json: {\n    employee_id: w.id,\n    full_name: `${w.firstName} ${w.lastName}`,\n    email: w.workEmail,\n    department: w.department?.descriptor ?? '',\n    title: w.jobTitle?.descriptor ?? '',\n    manager_email: w.manager?.workEmail ?? '',\n    start_date: w.hireDate,\n    location: w.location?.descriptor ?? 'Remote',\n    employment_type: w.workerType === 'Contingent_Worker' ? 'contractor' : 'full-time'\n  }\n}];"
+      },
+      "id": "node-normalize",
+      "name": "Normalize — Workday to NewHireEvent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 180]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.PROVISIONING_ENGINE_URL }}/webhooks/workday",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" },
+            {
+              "name": "X-HeliosHR-Signature",
+              "value": "={{ $crypto.hmac('sha256', $env.WEBHOOK_SECRET, JSON.stringify($json)) }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": { "parameters": [] },
+        "options": {
+          "response": { "response": { "responseFormat": "json" } }
+        },
+        "jsonBody": "={{ JSON.stringify($json) }}"
+      },
+      "id": "node-call-engine",
+      "name": "POST to Provisioning Engine",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1100, 180]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "cond-success",
+              "leftValue": "={{ $json.overall_success }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equals" }
+            }
+          ]
+        }
+      },
+      "id": "node-check-result",
+      "name": "Provisioning succeeded?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1320, 180]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": { "value": "C_IT_ALERTS", "mode": "id" },
+        "text": ":white_check_mark: *New hire provisioned*\n*Name:* {{ $json.employee_name }}\n*ID:* {{ $json.employee_id }}\n*Systems:* {{ $json.system_results.filter(s => s.success).map(s => s.system).join(', ') }}",
+        "otherOptions": {}
+      },
+      "id": "node-slack-success",
+      "name": "Slack — Provisioning complete",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [1540, 60],
+      "credentials": { "slackApi": { "id": "cred-slack", "name": "Slack Bot" } }
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": { "value": "C_IT_ALERTS", "mode": "id" },
+        "text": ":x: *Provisioning issue — action required*\n*Name:* {{ $json.employee_name }}\n*Decision:* {{ $json.decision }}\n*Failed systems:* {{ $json.system_results.filter(s => !s.success).map(s => `${s.system}: ${s.message}`).join('\\n') }}\n*Audit:* {{ $env.PROVISIONING_ENGINE_URL }}/audit/{{ $json.employee_id }}",
+        "otherOptions": {}
+      },
+      "id": "node-slack-failure",
+      "name": "Slack — Alert IT on failure",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [1540, 300],
+      "credentials": { "slackApi": { "id": "cred-slack", "name": "Slack Bot" } }
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": { "value": "C_IT_ALERTS", "mode": "id" },
+        "text": ":information_source: Workday poll returned no new active hires.",
+        "otherOptions": {}
+      },
+      "id": "node-no-hires",
+      "name": "Slack — No new hires (debug)",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [660, 420],
+      "credentials": { "slackApi": { "id": "cred-slack", "name": "Slack Bot" } }
+    }
+  ],
+  "connections": {
+    "Every 5 min — Poll Workday": {
+      "main": [[{ "node": "Workday — Get New Active Workers", "type": "main", "index": 0 }]]
+    },
+    "Workday — Get New Active Workers": {
+      "main": [[{ "node": "Any new hires?", "type": "main", "index": 0 }]]
+    },
+    "Any new hires?": {
+      "main": [
+        [{ "node": "Split — one item per hire", "type": "main", "index": 0 }],
+        [{ "node": "Slack — No new hires (debug)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Split — one item per hire": {
+      "main": [[{ "node": "Normalize — Workday to NewHireEvent", "type": "main", "index": 0 }]]
+    },
+    "Normalize — Workday to NewHireEvent": {
+      "main": [[{ "node": "POST to Provisioning Engine", "type": "main", "index": 0 }]]
+    },
+    "POST to Provisioning Engine": {
+      "main": [[{ "node": "Provisioning succeeded?", "type": "main", "index": 0 }]]
+    },
+    "Provisioning succeeded?": {
+      "main": [
+        [{ "node": "Slack — Provisioning complete", "type": "main", "index": 0 }],
+        [{ "node": "Slack — Alert IT on failure", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "errorWorkflow": "helioshr-error-handler"
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": "helioshr-onboarding-automation"
+  },
+  "tags": [{ "name": "onboarding" }, { "name": "hr-automation" }],
+  "_comment": "Import into n8n via Settings > Import Workflow. Set env vars: PROVISIONING_ENGINE_URL, WEBHOOK_SECRET. Wire credentials: Workday OAuth2, Slack Bot."
+}
